@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument(
         "--batch-size", type=int, default=64, help="Batch size per GPU."
     )
-    parser.add_argument("--mae_loss", type=bool, default=True)
+    parser.add_argument("--3d_loss", type=bool, default=True)
     parser.add_argument("--debug", type=bool, default=True) 
 
     args = parser.parse_args()
@@ -93,7 +93,7 @@ def main():
         model.train() 
         clip_loss = ClipLoss() 
         loss_cum = .0 
-        progress = tqdm(total=len(train_loader), desc='ee-clip training') 
+        progress = tqdm(total=len(train_loader), desc='Union training') 
         for i, batch in enumerate(train_loader):  
             images, texts = batch 
             images = images.to(device=device)
@@ -112,7 +112,7 @@ def main():
 
         model.eval() 
         with torch.no_grad(): 
-            progress = tqdm(total=len(val_loader), desc='ee-clip evaluation') 
+            progress = tqdm(total=len(val_loader), desc='Union evaluation') 
             acc_cum = .0
             for i, batch in enumerate(val_loader):
                 images, texts = batch 
