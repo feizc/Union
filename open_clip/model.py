@@ -260,13 +260,51 @@ class Union(nn.Module):
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         return F.normalize(x, dim=-1) if normalize else x
 
-    def forward(self, image, text):
+    def encode_image_and_text(self, image, text, normalize: bool = False):
+        # img emb
+        img_x = self.visual.conv1(image) 
+        img_x = img_x.reshape(img_x.shape[0], img_x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        img_x = img_x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        img_x = torch.cat(
+            [self.visual.class_embedding.to(img_x.dtype) + torch.zeros(img_x.shape[0], 1, img_x.shape[-1], dtype=img_x.dtype, device=img_x.device),
+             img_x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        img_x = img_x + self.visual.positional_embedding.to(img_x.dtype)
+        img_x = self.visual.patch_dropout(img_x)
+        img_x = self.visual.ln_pre(img_x)
+        img_len = img_x.size(1) 
+
+        # text emb 
+        cast_dtype = self.transformer.get_cast_dtype()
+        text_x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+
+        text_x = text_x + self.positional_embedding.to(cast_dtype)
+
+        img_text_x = torch.cat([img_x, text_x], dim=1) 
+        img_text_x = img_text_x.permute(1, 0, 2)  # NLD -> LND
+        img_text_x = self.transformer(img_text_x) # attn_mask=self.attn_mask)
+        img_text_x = img_text_x.permute(1, 0, 2)  # LND -> NLD
+
+        img_x = img_text_x[:, 0] 
+        img_x = self.visual.ln_post(img_x) 
+        img_x = img_x @ self.visual.proj 
+
+        text_x = self.ln_final(img_text_x)
+        text_x = text_x[torch.arange(text_x.shape[0]), img_len + text.argmax(dim=-1)] @ self.text_projection
+
+        img_text_x = (img_x + text_x) // 2.
+        return F.normalize(img_text_x, dim=-1) if normalize else img_text_x
+
+
+    def forward(self, image, text, image_comple=None, text_comple=None):
         image_features = self.encode_image(image, normalize=True)
-        text_features = self.encode_text(text, normalize=True)
-        return image_features, text_features, self.logit_scale.exp()
+        text_features = self.encode_text(text, normalize=True) 
 
-
-
+        if image_comple is not None and text_comple is not None: 
+            image_text_features = self.encode_image_and_text(image, text, normalize=True) 
+            return image_features, text_features, image_text_features, self.logit_scale.exp()
+        else:
+            return image_features, text_features, self.logit_scale.exp()
+    
 
 
 class CustomTextCLIP(nn.Module):
