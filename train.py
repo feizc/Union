@@ -98,8 +98,8 @@ def main():
             images, texts = batch 
             images = images.to(device=device)
             texts = texts.to(device=device)
-            
-            image_features, text_features, logit_scale = model(images, texts) 
+
+            image_features, text_features, image_text_features, logit_scale = model(images, texts, images, texts) 
             total_loss = clip_loss(image_features, text_features, logit_scale) 
             total_loss.backward() 
             optimizer.step() 
@@ -118,7 +118,7 @@ def main():
                 images, texts = batch 
                 images = images.to(device=device)
                 texts = texts.to(device=device) 
-
+                
                 image_features, text_features, logit_scale = model(images, texts) 
                 logits = torch.matmul(text_features, image_features.t()) * logit_scale 
                 pred = torch.argmax(logits, dim=-1) 
