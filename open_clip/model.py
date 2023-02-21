@@ -221,10 +221,10 @@ class Union(nn.Module):
         super().__init__()
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
 
-        text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
-
+        text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype) 
+        
         # share the same transformer, note that basic structure should be same 
-        self.visual.transformer = text.transformer 
+        self.visual.transformer = text.transformer
 
         self.transformer = text.transformer
         self.vocab_size = text.vocab_size
@@ -236,6 +236,9 @@ class Union(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
+    def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
+        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
+        self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
@@ -295,14 +298,342 @@ class Union(nn.Module):
         return F.normalize(img_text_x, dim=-1) if normalize else img_text_x
 
 
-    def forward(self, image, text, image_comple=None, text_comple=None):
-        image_features = self.encode_image(image, normalize=True)
-        text_features = self.encode_text(text, normalize=True) 
-
-        if image_comple is not None and text_comple is not None: 
+    def forward(self, image, text, combine=False): 
+        if combine == False:
+            image_features = self.encode_image(image, normalize=True)
+            text_features = self.encode_text(text, normalize=True)
+            return image_features, text_features, self.logit_scale.exp()
+        else: 
             image_text_features = self.encode_image_and_text(image, text, normalize=True) 
-            return image_features, text_features, image_text_features, self.logit_scale.exp()
+            return image_text_features, self.logit_scale.exp()
+
+
+"""
+    masking complemntary with no same parts
+"""
+class Union_Complem(nn.Module):
+    def __init__(
+            self,
+            embed_dim: int,
+            vision_cfg: CLIPVisionCfg,
+            text_cfg: CLIPTextCfg,
+            quick_gelu: bool = False,
+            cast_dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
+
+        text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+
+        # share the same transformer, note that basic structure should be same 
+        self.visual.transformer = text.transformer 
+
+        self.transformer = text.transformer
+        self.vocab_size = text.vocab_size
+        self.token_embedding = text.token_embedding
+        self.positional_embedding = text.positional_embedding
+        self.ln_final = text.ln_final
+        self.text_projection = text.text_projection
+        self.register_buffer('attn_mask', text.attn_mask, persistent=False)
+
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.visual.set_grad_checkpointing(enable)
+        self.transformer.grad_checkpointing = enable
+
+    def encode_image(self, image, normalize: bool = False):
+        features = self.visual(image)
+        return F.normalize(features, dim=-1) if normalize else features
+
+    def encode_text(self, text, normalize: bool = False):
+        cast_dtype = self.transformer.get_cast_dtype()
+
+        x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+
+        x = x + self.positional_embedding.to(cast_dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)# attn_mask=self.attn_mask)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        return F.normalize(x, dim=-1) if normalize else x 
+
+    def random_masking(self, x, mask_ratio): 
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        Referring from mae
+        """
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - mask_ratio))
+        
+        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+        
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_masked
+
+
+    def encode_image_and_text(self, image, text, mask_ratio=0.5, normalize: bool = False):
+        # 1. img emb process
+        img_x = self.visual.conv1(image) 
+        img_x = img_x.reshape(img_x.shape[0], img_x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        img_x = img_x.permute(0, 2, 1)  # shape = [*, grid ** 2, width] 
+        img_x = img_x + self.visual.positional_embedding[1:, :].to(img_x.dtype)
+
+        # image mask pattern 1
+        img_x_1 = self.random_masking(img_x.detach().clone(), mask_ratio) 
+        cls_token = self.visual.class_embedding.to(img_x.dtype) + self.visual.positional_embedding[:1, :] 
+        # print(cls_token.size(), img_x_1.size())
+        img_x_1 = torch.cat([cls_token.to(img_x_1.device) + torch.zeros(img_x_1.shape[0], 1, img_x_1.shape[-1], dtype=img_x_1.dtype, device=img_x_1.device), img_x_1], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        img_x_1 = self.visual.ln_pre(img_x_1)
+        
+        img_x_1 = img_x_1.permute(1, 0, 2)  # NLD -> LND
+        img_x_1 = self.transformer(img_x_1) # attn_mask=self.attn_mask)
+        img_x_1 = img_x_1.permute(1, 0, 2)  # LND -> NLD 
+        img_x_1 = img_x_1[:, 0] 
+        img_x_1 = self.visual.ln_post(img_x_1) 
+        img_x_1 = img_x_1 @ self.visual.proj 
+        img_x_1 = F.normalize(img_x_1, dim=-1) if normalize else img_x_1
+
+        # image mask pattern 2
+        img_x_2 = self.random_masking(img_x, mask_ratio) 
+        cls_token_2 = self.visual.class_embedding.to(img_x.dtype) + self.visual.positional_embedding[:1, :] 
+        img_x_2 = torch.cat([cls_token_2.to(img_x_2.device) + torch.zeros(img_x_2.shape[0], 1, img_x_2.shape[-1], dtype=img_x_2.dtype, device=img_x_2.device), img_x_2], dim=1)  # shape = [*, grid ** 2 + 1, width]  img_x = self.visual.patch_dropout(img_x) 
+
+        img_x_2 = self.visual.ln_pre(img_x_2)
+        img_len = img_x_2.size(1) 
+        # 2. text emb process 
+        cast_dtype = self.transformer.get_cast_dtype()
+        text_x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+
+        text_x = text_x + self.positional_embedding.to(cast_dtype) 
+
+        # text mask pattern 1 
+        text_x_1 = text_x.detach().clone() 
+        text_x_1_pre, text_x_1_post = torch.split(text_x_1, (10, 67), dim=1) 
+        text_x_1_pre = self.random_masking(text_x_1_pre, mask_ratio) 
+        text_x_1 = torch.cat((text_x_1_pre, text_x_1_post), dim=1) 
+        text_x_1 = text_x_1.permute(1, 0, 2)  # NLD -> LND
+        text_x_1 = self.transformer(text_x_1) #attn_mask=self.attn_mask)
+        text_x_1 = text_x_1.permute(1, 0, 2)  # LND -> NLD
+        text_x_1 = self.ln_final(text_x_1)  # [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        text_x_1 = text_x_1[torch.arange(text_x_1.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        text_x_1 = F.normalize(text_x_1, dim=-1) if normalize else text_x_1 
+
+
+        # text mask pattern 2
+        text_x_2_pre, text_x_2_post = torch.split(text_x, (10, 67), dim=1) 
+        text_x_2_pre = self.random_masking(text_x_2_pre, mask_ratio) 
+        text_x_2 = torch.cat((text_x_2_pre, text_x_2_post), dim=1) 
+        #text_x_2 = text_x
+        img_text_x = torch.cat([img_x_2, text_x_2], dim=1) 
+        img_text_x = img_text_x.permute(1, 0, 2)  # NLD -> LND
+        img_text_x = self.transformer(img_text_x) # attn_mask=self.attn_mask)
+        img_text_x = img_text_x.permute(1, 0, 2)  # LND -> NLD
+
+        img_x_2 = img_text_x[:, 0] 
+        img_x_2 = self.visual.ln_post(img_x_2) 
+        img_x_2 = img_x_2 @ self.visual.proj 
+
+        text_x_2 = self.ln_final(img_text_x)
+        text_x_2 = text_x_2[torch.arange(text_x_2.shape[0]), img_len + text.argmax(dim=-1)] @ self.text_projection
+
+        img_text_x = torch.div(img_x_2 + text_x_2, 2) 
+        image_text_x = F.normalize(img_text_x, dim=-1) if normalize else img_text_x
+        return img_x_1, text_x_1, image_text_x 
+
+
+    def forward(self, image, text, mask_ratio=0.):
+        if mask_ratio > 0.: 
+            image_features, text_features, image_text_features = self.encode_image_and_text(image, text, mask_ratio, normalize=True) 
+            return image_features, text_features, image_text_features, self.logit_scale.exp() 
         else:
+            image_features = self.encode_image(image, normalize=True)
+            text_features = self.encode_text(text, normalize=True) 
+            return image_features, text_features, self.logit_scale.exp()
+    
+
+
+"""
+    random masking according to masking ratio, exist same parts in different pattern
+"""
+class Union_Rand(nn.Module):
+    def __init__(
+            self,
+            embed_dim: int,
+            vision_cfg: CLIPVisionCfg,
+            text_cfg: CLIPTextCfg,
+            quick_gelu: bool = False,
+            cast_dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
+
+        text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+
+        # share the same transformer, note that basic structure should be same 
+        self.visual.transformer = text.transformer 
+
+        self.transformer = text.transformer
+        self.vocab_size = text.vocab_size
+        self.token_embedding = text.token_embedding
+        self.positional_embedding = text.positional_embedding
+        self.ln_final = text.ln_final
+        self.text_projection = text.text_projection
+        self.register_buffer('attn_mask', text.attn_mask, persistent=False)
+
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.visual.set_grad_checkpointing(enable)
+        self.transformer.grad_checkpointing = enable
+
+    def encode_image(self, image, normalize: bool = False):
+        features = self.visual(image)
+        return F.normalize(features, dim=-1) if normalize else features
+
+    def encode_text(self, text, normalize: bool = False):
+        cast_dtype = self.transformer.get_cast_dtype()
+
+        x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+
+        x = x + self.positional_embedding.to(cast_dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x, attn_mask=self.attn_mask)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        return F.normalize(x, dim=-1) if normalize else x 
+
+    def random_masking(self, x, mask_ratio): 
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        Referring from mae
+        """
+        N, L, D = x.shape  # batch, length, dim
+        len_keep = int(L * (1 - mask_ratio))
+        
+        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+        
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_masked
+
+
+    def encode_image_and_text(self, image, text, mask_ratio, normalize: bool = False):
+        # 1. img emb process
+        img_x = self.visual.conv1(image) 
+        img_x = img_x.reshape(img_x.shape[0], img_x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        img_x = img_x.permute(0, 2, 1)  # shape = [*, grid ** 2, width] 
+        img_x = img_x + self.visual.positional_embedding[1:, :].to(img_x.dtype)
+
+        # image mask pattern 1
+        img_x_1 = self.random_masking(img_x.detach().clone(), mask_ratio) 
+        cls_token = self.visual.class_embedding.to(img_x.dtype) + self.visual.positional_embedding[:1, :] 
+        # print(cls_token.size(), img_x_1.size())
+        img_x_1 = torch.cat([cls_token.to(img_x_1.device) + torch.zeros(img_x_1.shape[0], 1, img_x_1.shape[-1], dtype=img_x_1.dtype, device=img_x_1.device), img_x_1], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        img_x_1 = self.visual.ln_pre(img_x_1)
+        
+        img_x_1 = img_x_1.permute(1, 0, 2)  # NLD -> LND
+        img_x_1 = self.transformer(img_x_1) # attn_mask=self.attn_mask)
+        img_x_1 = img_x_1.permute(1, 0, 2)  # LND -> NLD 
+        img_x_1 = img_x_1[:, 0] 
+        img_x_1 = self.visual.ln_post(img_x_1) 
+        img_x_1 = img_x_1 @ self.visual.proj 
+        img_x_1 = F.normalize(img_x_1, dim=-1) if normalize else img_x_1
+
+        # image mask pattern 2
+        img_x_2 = self.random_masking(img_x, mask_ratio) 
+        cls_token_2 = self.visual.class_embedding.to(img_x.dtype) + self.visual.positional_embedding[:1, :] 
+        img_x_2 = torch.cat([cls_token_2.to(img_x_2.device) + torch.zeros(img_x_2.shape[0], 1, img_x_2.shape[-1], dtype=img_x_2.dtype, device=img_x_2.device), img_x_2], dim=1)  # shape = [*, grid ** 2 + 1, width]  img_x = self.visual.patch_dropout(img_x) 
+
+        img_x_2 = self.visual.ln_pre(img_x_2)
+        img_len = img_x_2.size(1) 
+        # 2. text emb process 
+        cast_dtype = self.transformer.get_cast_dtype()
+        text_x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+
+        text_x = text_x + self.positional_embedding.to(cast_dtype) 
+
+        # text mask pattern 1 
+        text_x_1 = text_x.detach().clone() 
+        #text_x_1_pre, text_x_1_post = torch.split(text_x_1, (10, 67), dim=1) 
+        #text_x_1_pre = self.random_masking(text_x_1_pre, mask_ratio) 
+        #text_x_1 = torch.cat((text_x_1_pre, text_x_1_post), dim=1) 
+        text_x_1 = text_x_1.permute(1, 0, 2)  # NLD -> LND
+        text_x_1 = self.transformer(text_x_1, attn_mask=self.attn_mask)
+        text_x_1 = text_x_1.permute(1, 0, 2)  # LND -> NLD
+        text_x_1 = self.ln_final(text_x_1)  # [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        text_x_1 = text_x_1[torch.arange(text_x_1.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        text_x_1 = F.normalize(text_x_1, dim=-1) if normalize else text_x_1 
+
+
+        # text mask pattern 2
+        #text_x_2_pre, text_x_2_post = torch.split(text_x, (10, 67), dim=1) 
+        #text_x_2_pre = self.random_masking(text_x_2_pre, mask_ratio) 
+        #text_x_2 = torch.cat((text_x_2_pre, text_x_2_post), dim=1) 
+        text_x_2 = text_x
+        img_text_x = torch.cat([img_x_2, text_x_2], dim=1) 
+        img_text_x = img_text_x.permute(1, 0, 2)  # NLD -> LND
+        img_text_x = self.transformer(img_text_x) # attn_mask=self.attn_mask)
+        img_text_x = img_text_x.permute(1, 0, 2)  # LND -> NLD
+
+        img_x_2 = img_text_x[:, 0] 
+        img_x_2 = self.visual.ln_post(img_x_2) 
+        img_x_2 = img_x_2 @ self.visual.proj 
+
+        text_x_2 = self.ln_final(img_text_x)
+        text_x_2 = text_x_2[torch.arange(text_x_2.shape[0]), img_len + text.argmax(dim=-1)] @ self.text_projection
+
+        img_text_x = torch.div(img_x_2 + text_x_2, 2) 
+        image_text_x = F.normalize(img_text_x, dim=-1) if normalize else img_text_x
+        return img_x_1, text_x_1, image_text_x 
+
+
+    def forward(self, image, text, mask_ratio=0.):
+        if mask_ratio > 0.: 
+            image_features, text_features, image_text_features = self.encode_image_and_text(image, text, mask_ratio, normalize=True) 
+            return image_features, text_features, image_text_features, self.logit_scale.exp() 
+        else:
+            image_features = self.encode_image(image, normalize=True)
+            text_features = self.encode_text(text, normalize=True) 
             return image_features, text_features, self.logit_scale.exp()
     
 
