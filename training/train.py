@@ -201,14 +201,14 @@ def train_one_epoch(model, data, epoch, optimizer, scaler, scheduler, args, tb_w
     # end for
 
 
-def evaluate(model, data, epoch, args, tb_writer=None):
+def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     metrics = {}
     if not is_master(args):
         return metrics
     device = torch.device(args.device)
     model.eval()
 
-    zero_shot_metrics = zero_shot_eval(model, data, epoch, args)
+    zero_shot_metrics = zero_shot_eval(model, data, epoch, args, tokenizer)
     metrics.update(zero_shot_metrics)
 
     autocast = get_autocast(args.precision)
@@ -271,20 +271,20 @@ def evaluate(model, data, epoch, args, tb_writer=None):
         + "\t".join([f"{k}: {round(v, 4):.4f}" for k, v in metrics.items()])
     )
 
-    if args.save_logs:
-        for name, val in metrics.items():
-            if tb_writer is not None:
-                tb_writer.add_scalar(f"val/{name}", val, epoch)
+    #if args.save_logs:
+    for name, val in metrics.items():
+        if tb_writer is not None:
+            tb_writer.add_scalar(f"val/{name}", val, epoch)
 
-        with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
-            f.write(json.dumps(metrics))
-            f.write("\n")
-
+    #with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
+    #    f.write(json.dumps(metrics))
+    #    f.write("\n")
+    """
     if args.wandb:
         assert wandb is not None, 'Please install wandb.'
         for name, val in metrics.items():
             wandb.log({f"val/{name}": val, 'epoch': epoch})
-
+    """
     return metrics
 
 

@@ -9,13 +9,14 @@ from .precision import get_autocast
 from .imagenet_zeroshot_data import imagenet_classnames, openai_imagenet_template
 
 
-def zero_shot_classifier(model, classnames, templates, args):
-    tokenizer = get_tokenizer(args.model)
+def zero_shot_classifier(model, classnames, templates, args, tokenizer):
+    
     with torch.no_grad():
         zeroshot_weights = []
         for classname in tqdm(classnames):
             texts = [template(classname) for template in templates]  # format with class
-            texts = tokenizer(texts).to(args.device)  # tokenize
+            #texts = tokenizer(texts).to(args.device)  # tokenize
+            texts = tokenizer(texts, padding="max_length", max_length=77, truncation=True, return_tensors="pt",)['input_ids'].to(args.device)
             if args.distributed and not args.horovod:
                 class_embeddings = model.module.encode_text(texts)
             else:
@@ -64,7 +65,7 @@ def run(model, classifier, dataloader, args):
     return top1, top5
 
 
-def zero_shot_eval(model, data, epoch, args):
+def zero_shot_eval(model, data, epoch, args, tokenizer):
     if 'imagenet-val' not in data and 'imagenet-v2' not in data:
         return {}
     if args.zeroshot_frequency == 0:
@@ -75,7 +76,7 @@ def zero_shot_eval(model, data, epoch, args):
     logging.info('Starting zero-shot imagenet.')
 
     logging.info('Building zero-shot classifier')
-    classifier = zero_shot_classifier(model, imagenet_classnames, openai_imagenet_template, args)
+    classifier = zero_shot_classifier(model, imagenet_classnames, openai_imagenet_template, args, tokenizer)
 
     logging.info('Using classifier')
     results = {}
