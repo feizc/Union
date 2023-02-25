@@ -64,6 +64,23 @@ class EMA(nn.Module):
         self.register_buffer('step', torch.tensor([0]))
 
 
+    def restore_ema_model_device(self):
+        device = self.initted.device
+        self.ema_model.to(device)
+
+
+    def get_params_iter(self, model):
+        for name, param in model.named_parameters():
+            if name not in self.parameter_names:
+                continue
+            yield name, param
+
+    def get_buffers_iter(self, model):
+        for name, buffer in model.named_parameters():
+            if name not in self.buffer_names:
+                continue
+            yield name, buffer
+
 
     def copy_params_from_model_to_ema(self):
         for (_, ma_params), (_, current_params) in zip(self.get_params_iter(self.ema_model), self.get_params_iter(self.model)):
@@ -89,6 +106,16 @@ class EMA(nn.Module):
             self.initted.data.copy_(torch.Tensor([True]))
 
         self.update_moving_average(self.ema_model, self.model)
+
+
+    def get_current_decay(self):
+        epoch = clamp(self.step.item() - self.update_after_step - 1, min_value = 0.)
+        value = 1 - (1 + epoch / self.inv_gamma) ** - self.power
+
+        if epoch <= 0:
+            return 0.
+
+        return clamp(value, min_value = self.min_value, max_value = self.beta) 
 
 
     @torch.no_grad()

@@ -294,7 +294,7 @@ class Union(nn.Module):
         text_x = self.ln_final(img_text_x)
         text_x = text_x[torch.arange(text_x.shape[0]), img_len + text.argmax(dim=-1)] @ self.text_projection
 
-        img_text_x = (img_x + text_x) // 2.
+        img_text_x = torch.div(img_x + text_x, 2.0) # (img_x + text_x) // 2.
         return F.normalize(img_text_x, dim=-1) if normalize else img_text_x
 
 
