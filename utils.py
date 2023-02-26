@@ -1,13 +1,52 @@
 import os 
 import json 
-from PIL import Image 
+from PIL import Image, ImageFilter, ImageOps
 import torch.nn.functional as F
+import random 
 
 import torch 
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, IterableDataset, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
-from torchvision import datasets 
+from torchvision import datasets, transforms 
 from tqdm import tqdm
+
+
+
+class GaussianBlur(object):
+    """
+    Apply Gaussian Blur to the PIL image.
+    """
+    def __init__(self, p=0.5, radius_min=0.1, radius_max=2.):
+        self.prob = p
+        self.radius_min = radius_min
+        self.radius_max = radius_max
+
+    def __call__(self, img):
+        do_it = random.random() <= self.prob
+        if not do_it:
+            return img
+
+        return img.filter(
+            ImageFilter.GaussianBlur(
+                radius=random.uniform(self.radius_min, self.radius_max)
+            )
+        )
+
+
+class Solarization(object):
+    """
+    Apply Solarization to the PIL image.
+    """
+    def __init__(self, p):
+        self.p = p
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            return ImageOps.solarize(img)
+        else:
+            return img
+
+
 
 
 def zero_shot_classifier(model, classnames, templates, tokenizer, device):
@@ -55,7 +94,7 @@ def accuracy(output, target, topk=(1,)):
 
 
 class CC3MDataset(Dataset):
-    def __init__(self, input_filename, transforms, tokenizer=None, is_train=True):
+    def __init__(self, input_filename, proprocess, tokenizer=None, is_train=True, multi_view=False):
         train_json_path = os.path.join(input_filename, 'train.json')
         with open(train_json_path, 'r', encoding='utf-8') as f: 
             self.data = json.load(f)
@@ -67,27 +106,57 @@ class CC3MDataset(Dataset):
 
         self.input_filename = input_filename 
 
-        self.transforms = transforms
+        self.transforms = proprocess
         print('Done loading data.')
 
-        self.tokenize = tokenizer
+        self.tokenize = tokenizer 
+        self.aug_flag = False 
+
+        # data augumentation referred from: https://github.com/bytedance/ibot/blob/main/main_ibot.py
+        if is_train == True and multi_view == True: 
+            global_crops_scale = (0.14, 1.) 
+            flip_and_color_jitter = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomApply(
+                    [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+                    p=0.8
+                ),
+                transforms.RandomGrayscale(p=0.2),
+            ])
+            normalize = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            ])
+            self.aug_transforms = transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+                flip_and_color_jitter,
+                GaussianBlur(0.1),
+                Solarization(0.2),
+                normalize,
+            ])
+            self.aug_flag = True 
+
+
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        images_path = os.path.join(self.input_filename, self.data[idx]['image'][6:])
-        images = self.transforms(Image.open(images_path))
+        images_path = os.path.join(self.input_filename, self.data[idx]['image'][6:]) 
+        raw_images = Image.open(images_path)
+        images = self.transforms(raw_images)
         texts = self.tokenize(self.data[idx]['caption'],
                                 padding="max_length",
                                 max_length=77,
                                 truncation=True,
-                                return_tensors="pt",)
+                                return_tensors="pt",) 
+        if self.aug_flag == True: 
+            aug_images = self.aug_transforms(raw_images) 
+            return images, aug_images, texts['input_ids'].squeeze(0)
         return images, texts['input_ids'].squeeze(0)
 
 
-
-def get_cc3m_dataset(args, preprocess_fn, is_train, tokenizer=None):
+def get_cc3m_dataset(args, preprocess_fn, is_train, tokenizer=None, multi_view=False):
     input_filename = args.train_data 
     assert input_filename
     
@@ -95,7 +164,9 @@ def get_cc3m_dataset(args, preprocess_fn, is_train, tokenizer=None):
         input_filename,
         preprocess_fn,
 		tokenizer=tokenizer,
-        is_train=is_train)
+        is_train=is_train,
+        multi_view=multi_view,
+    )
     
     num_samples = len(dataset) 
     print(num_samples)
